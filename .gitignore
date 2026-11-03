@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Private keys and certs
+*.key
+*.pem
+*.pub
+id_rsa*
+
+# Dynamic inventory and logs
+hosts.yaml
+*.log
+*.retry
+
+# Vagrant
+.vagrant/
+
+# Ansible
+.ansible/
