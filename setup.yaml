@@ -1,0 +1,86 @@
+- name: Configure Ubuntu server for Vagrant with libvirt and deploy VM
+  hosts: localhost
+  become: yes
+  vars:
+    username: "devuser"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - qemu-kvm
+          - bridge-utils
+          - virtinst
+          - libvirt-daemon-system
+          - libvirt-dev
+          - build-essential
+        update_cache: yes
+
+    - name: Enable libvirtd service
+      systemd:
+        name: libvirtd
+        enabled: yes
+        state: started
+
+    - name: Create user {{ username }} without password
+      user:
+        name: "{{ username }}"
+        password: "!"
+        groups: libvirt
+        append: yes
+        generate_ssh_key: yes
+        ssh_key_type: rsa
+        ssh_key_file: .ssh/id_rsa
+
+    - name: Add {{ username }} public key to authorized_keys
+      authorized_key:
+        user: "{{ username }}"
+        state: present
+        key: "{{ lookup('file', '/home/{{ username }}/.ssh/id_rsa.pub') }}"
+
+    - name: Download and add HashiCorp GPG key
+      shell: wget -O - https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+      become: yes
+
+    - name: Add HashiCorp repository to apt sources
+      shell: echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/hashicorp.list
+      become: yes
+
+
+    - name: Update all packages
+      apt:
+        update_cache: yes
+
+    - name: Install Vagrant
+      apt:
+        name: vagrant
+        state: present
+
+    - name: Install vagrant-libvirt plugin
+      command: vagrant plugin install vagrant-libvirt
+      become: yes
+      become_user: "{{ username }}"
+
+    - name: Set VAGRANT_DEFAULT_PROVIDER environment variable
+      lineinfile:
+        path: /etc/environment
+        regexp: '^VAGRANT_DEFAULT_PROVIDER='
+        line: 'VAGRANT_DEFAULT_PROVIDER=libvirt'
+        state: present
+
+    - name: Copy Vagrantfile to {{ username }} home
+      copy:
+        src: Vagrantfile
+        dest: /home/{{ username }}/Vagrantfile
+        owner: "{{ username }}"
+        group: "{{ username }}"
+        mode: '0644'
+
+    - name: Start Vagrant VM
+      command: vagrant up
+      args:
+        chdir: /home/{{ username }}
+      become: yes
+      become_user: "{{ username }}"
+      environment:
+        VAGRANT_DEFAULT_PROVIDER: libvirt

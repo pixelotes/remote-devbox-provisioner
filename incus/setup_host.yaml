@@ -1,0 +1,229 @@
+- name: Install Incus and setup Ubuntu 24.04 VM
+  become: true
+  hosts: localhost
+  vars:
+    username: "devuser"
+    ipv4_address: "10.0.0.100" # Static ip for the vm
+    vm_profile: "xxl-vm-profile"
+    vm_image: "images:ubuntu/24.04" # Official Linux Containers image
+    vm_type: "virtual-machine"
+
+  tasks:
+    # Upgrade all packages in the host
+    - name: Upgrade packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+
+    # Create user
+    - name: Create user {{ username }} without password
+      user:
+        name: "{{ username }}"
+        password: "!"
+        shell: /bin/bash
+        generate_ssh_key: yes
+        ssh_key_type: rsa
+        ssh_key_file: .ssh/id_rsa
+
+    - name: Add {{ username }} public key to authorized_keys
+      authorized_key:
+        user: "{{ username }}"
+        state: present
+        key: "{{ lookup('file', '/home/{{ username }}/.ssh/id_rsa.pub') }}"
+
+    # Check if Incus is installed
+    - name: Check if Incus is installed
+      command: which incus
+      register: incus_installed
+      failed_when: false
+      changed_when: false
+
+    # Install Incus via official Zabbly repository if not present
+    - name: Install prerequisites for Zabbly repo
+      apt:
+        name:
+          - curl
+          - gpg
+          - software-properties-common
+        state: present
+      when: incus_installed.rc != 0
+
+    - name: Ensure keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+      when: incus_installed.rc != 0
+
+    - name: Download Zabbly repository GPG key
+      shell: curl -fsSL https://pkgs.zabbly.com/key.asc | gpg --dearmor -o /etc/apt/keyrings/zabbly.asc
+      args:
+        creates: /etc/apt/keyrings/zabbly.asc
+      when: incus_installed.rc != 0
+
+    - name: Add Zabbly Incus stable apt source
+      copy:
+        dest: /etc/apt/sources.list.d/zabbly-incus-stable.sources
+        content: |
+          Enabled: yes
+          Types: deb
+          URIs: https://pkgs.zabbly.com/incus/stable
+          Suites: {{ ansible_distribution_release }}
+          Components: main
+          Architectures: {{ 'amd64' if ansible_architecture == 'x86_64' else ansible_architecture }}
+          Signed-By: /etc/apt/keyrings/zabbly.asc
+      when: incus_installed.rc != 0
+
+    - name: Install Incus package
+      apt:
+        name: incus
+        state: present
+        update_cache: yes
+      when: incus_installed.rc != 0
+
+    # Ensure incus service is started and enabled
+    - name: Ensure incus service is enabled and running
+      systemd:
+        name: incus
+        enabled: yes
+        state: started
+
+    # Wait for Incus socket
+    - name: Wait for Incus socket to be ready
+      wait_for:
+        path: /var/lib/incus/unix.socket
+        state: present
+        timeout: 30
+
+    # Check if Incus is already initialized
+    - name: Check if default storage pool exists
+      command: incus storage show default
+      register: incus_storage_check
+      failed_when: false
+      changed_when: false
+
+    # Initialize Incus with preseed
+    - name: Initialize Incus with preseed file
+      command: cat preseed.yaml | incus admin init --preseed
+      when: incus_storage_check.rc != 0
+
+    # Helper function / tasks to create profiles
+    - name: Define hardware profiles
+      set_fact:
+        hardware_profiles:
+          - name: s-vm-profile
+            cpu: "1"
+            memory: "2GB"
+            disk: "20GB"
+          - name: m-vm-profile
+            cpu: "2"
+            memory: "4GB"
+            disk: "40GB"
+          - name: l-vm-profile
+            cpu: "4"
+            memory: "8GB"
+            disk: "60GB"
+          - name: xl-vm-profile
+            cpu: "4"
+            memory: "16GB"
+            disk: "80GB"
+          - name: xxl-vm-profile
+            cpu: "16"
+            memory: "64GB"
+            disk: "6TB"
+
+    - name: Check existing Incus profiles
+      command: incus profile list -f csv
+      register: existing_profiles
+      changed_when: false
+
+    - name: Create missing Incus hardware profiles
+      command: incus profile create {{ item.name }}
+      when: item.name not in existing_profiles.stdout
+      loop: "{{ hardware_profiles }}"
+
+    - name: Configure Incus hardware profiles
+      shell: |
+        cat <<'EOF' | incus profile edit {{ item.name }}
+        config:
+          limits.cpu: "{{ item.cpu }}"
+          limits.memory: "{{ item.memory }}"
+          security.secureboot: "false"
+        devices:
+          root:
+            path: /
+            pool: default
+            size: {{ item.disk }}
+            type: disk
+          eth0:
+            name: eth0
+            nictype: bridged
+            parent: incusbr0
+            type: nic
+        EOF
+      loop: "{{ hardware_profiles }}"
+
+    # Check if VM already exists
+    - name: Check if VM already exists
+      command: incus info {{ username }}-vm
+      register: vm_exists
+      failed_when: false
+      changed_when: false
+
+    # Create VM if not existing
+    - name: Create Ubuntu 24.04 VM
+      command: incus init {{ vm_image }} {{ username }}-vm --vm --profile default --profile {{ vm_profile }}
+      when: vm_exists.rc != 0
+
+    # Inventory file for Ansible
+    - name: Creating inventory file for ansible
+      copy:
+        dest: "./hosts.yaml"
+        content: |
+          all:
+            vars:
+              ansible_connection: community.general.incus
+              ansible_user: root
+              ansible_become: no
+              target_username: "{{ username }}"
+            hosts:
+              {{ username }}-vm:
+
+    # Check VM devices
+    - name: Check VM devices
+      command: incus config device show {{ username }}-vm
+      register: vm_devices
+      failed_when: false
+      changed_when: false
+
+    # Override network settings for static IP
+    - name: Override eth0 network device
+      command: incus network attach incusbr0 {{ username }}-vm eth0 eth0
+      when: "'eth0' not in vm_devices.stdout"
+      ignore_errors: yes
+
+    - name: Set up static IP address
+      command: incus config device set {{ username }}-vm eth0 ipv4.address {{ ipv4_address }}
+
+    # Check if VM is running
+    - name: Check VM state
+      command: incus list {{ username }}-vm -c s -f csv
+      register: vm_state
+      changed_when: false
+
+    # Start VM
+    - name: Start VM
+      command: incus start {{ username }}-vm
+      when: "'RUNNING' not in vm_state.stdout"
+
+    # Wait for VM to boot
+    - name: Wait 60 seconds for VM to initialize
+      pause:
+        seconds: 60
+      when: "'RUNNING' not in vm_state.stdout"
+
+    # Push public key to VM
+    - name: Copy public key to VM
+      command: incus file push /home/{{ username }}/.ssh/id_rsa.pub {{ username }}-vm/root/
+      ignore_errors: yes
+

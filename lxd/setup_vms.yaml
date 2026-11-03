@@ -1,0 +1,46 @@
+- name: Configure ssh access in vm
+  hosts: all
+  vars:
+    username: "{{ target_username | default('devuser') }}"
+  tasks:
+
+    # Upgrade all packages
+    - name: Upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    # Create user
+    - name: Create user {{ username }} without password
+      user:
+        name: "{{ username }}"
+        password: "!"
+        shell: /bin/bash
+        generate_ssh_key: no
+
+    - name: Grant {{ username }} sudo privileges without password
+      lineinfile:
+          path: /etc/sudoers
+          line: "{{ username }} ALL=(ALL) NOPASSWD:ALL"
+          validate: 'visudo -cf %s'
+
+    # Authorize cert
+    - name: Make sure .ssh dir exists
+      command: mkdir -p /home/{{ username }}/.ssh/
+
+    - name: fix perms for ssh dir
+      command: chmod 700 /home/{{ username }}/.ssh/
+
+    - name: copy the cert
+      command: cp /root/id_rsa.pub /home/{{ username }}/.ssh/
+
+    - name: fix perms for ssh pub key
+      command: chmod 600 /home/{{ username }}/.ssh/id_rsa.pub
+
+    # Authorize {{ username }} public key
+    - name: Authorize PK
+      authorized_key:
+        user: "{{ username }}"
+        state: present
+        key: "{{ lookup('file', '/home/{{ username }}/.ssh/id_rsa.pub') }}"
+      become: yes
